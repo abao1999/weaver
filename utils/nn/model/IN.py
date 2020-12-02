@@ -19,32 +19,48 @@ class INTagger(nn.Module):
         self.N = pf_dims
         self.S = sv_features_dims
         self.Nv = sv_dims
-        print(self.N,self.Nv)
-        print(self.P,self.S)
         self.Nr = self.N * (self.N - 1)
         self.Nt = self.N * self.Nv
-        self.Dr = 0
         self.De = De
-        self.Dx = 0
         self.Do = Do
         self.n_targets = num_classes
         self.hidden = hidden
         self.assign_matrices()
         self.assign_matrices_SV()
+        self.batchnorm_x = nn.BatchNorm1d(self.P)
+        self.batchnorm_y = nn.BatchNorm1d(self.S)
 
-        self.Ra = torch.ones(self.Dr, self.Nr)
-        self.fr1 = nn.Linear(2 * self.P + self.Dr, self.hidden).cuda()
-        self.fr2 = nn.Linear(self.hidden, int(self.hidden)).cuda()
-        self.fr3 = nn.Linear(int(self.hidden), self.De).cuda()
-        self.fr1_pv = nn.Linear(self.S + self.P + self.Dr, self.hidden).cuda()
-        self.fr2_pv = nn.Linear(self.hidden, int(self.hidden)).cuda()
-        self.fr3_pv = nn.Linear(int(self.hidden), self.De).cuda()
+        self.fr = nn.Sequential(nn.Linear(2 * self.P, self.hidden),
+                                nn.BatchNorm1d(self.hidden),
+                                nn.ReLU(),
+                                nn.Linear(self.hidden, self.hidden),
+                                nn.BatchNorm1d(self.hidden),
+                                nn.ReLU(),
+                                nn.Linear(self.hidden, self.De),
+                                nn.BatchNorm1d(self.De),
+                                nn.ReLU())
 
-        self.fo1 = nn.Linear(self.P + self.Dx + (2 * self.De), self.hidden).cuda()
-        self.fo2 = nn.Linear(self.hidden, int(self.hidden)).cuda()
-        self.fo3 = nn.Linear(int(self.hidden), self.Do).cuda()
-
-        self.fc_fixed = nn.Linear(self.Do, self.n_targets).cuda()
+        self.fr_pv = nn.Sequential(nn.Linear(self.S + self.P, self.hidden),
+                                   nn.BatchNorm1d(self.hidden),
+                                   nn.ReLU(),
+                                   nn.Linear(self.hidden, self.hidden),
+                                   nn.BatchNorm1d(self.hidden),
+                                   nn.ReLU(),
+                                   nn.Linear(self.hidden, self.De),
+                                   nn.BatchNorm1d(self.De),
+                                   nn.ReLU())
+        
+        self.fo = nn.Sequential(nn.Linear(self.P + (2 * self.De), self.hidden),
+                                nn.BatchNorm1d(self.hidden),
+                                nn.ReLU(),
+                                nn.Linear(self.hidden, self.hidden),
+                                nn.BatchNorm1d(self.hidden),
+                                nn.ReLU(),
+                                nn.Linear(self.hidden, self.Do),
+                                nn.BatchNorm1d(self.Do),
+                                nn.ReLU())
+        
+        self.fc_fixed = nn.Linear(self.Do, self.n_targets)
 
     def assign_matrices(self):
         self.Rr = torch.zeros(self.N, self.Nr)
@@ -53,8 +69,6 @@ class INTagger(nn.Module):
         for i, (r, s) in enumerate(receiver_sender_list):
             self.Rr[r, i] = 1
             self.Rs[s, i] = 1
-        self.Rr = (self.Rr).cuda()
-        self.Rs = (self.Rs).cuda()
 
     def assign_matrices_SV(self):
         self.Rk = torch.zeros(self.N, self.Nt)
@@ -63,57 +77,47 @@ class INTagger(nn.Module):
         for i, (k, v) in enumerate(receiver_sender_list):
             self.Rk[k, i] = 1
             self.Rv[v, i] = 1
-        self.Rk = (self.Rk).cuda()
-        self.Rv = (self.Rv).cuda()
 
-    def tmul(self, x, y):  #Takes (I * J * K)(K * L) -> I * J * L 
-        x_shape = x.size()
-        y_shape = y.size()
-        return torch.mm(x.view(-1, x_shape[2]), y).view(-1, x_shape[1], y_shape[1])
+    def edge_conv(self, x):
+        Orr = torch.matmul(x, self.Rr.to(device=x.device)) # [batch, P, Nr]
+        Ors = torch.matmul(x, self.Rs.to(device=x.device)) # [batch, P, Nr]
+        B = torch.cat([Orr, Ors], dim=-2) # [batch, 2*P, Nr]
+        B = B.transpose(-1, -2).contiguous() # [batch, Nr, 2*P]
+        E = self.fr(B.view(-1, 2*self.P)).view(-1, self.Nr, self.De) # [batch, Nr, De]
+        E = E.transpose(-1, -2).contiguous() # [batch, De, Nr]
+        Ebar_pp = torch.einsum('bij,kj->bik', E, self.Rr.to(device=x.device)) # [batch, De, N]
+        return Ebar_pp
 
+    def edge_conv_SV(self, x, y):
+        Ork = torch.matmul(x, self.Rk.to(device=x.device)) # [batch, P, Nt]
+        Orv = torch.matmul(y, self.Rv.to(device=x.device)) # [batch, S, Nt]
+        B = torch.cat([Ork, Orv], dim=-2) # [batch, P+S, Nt]
+        B = B.transpose(-1, -2).contiguous() # [batch, Nt, P+S]
+        E = self.fr_pv(B.view(-1, self.P+self.S)).view(-1, self.Nt, self.De) # [batch, Nt, De]
+        E = E.transpose(-1, -2).contiguous() # [batch, De, Nt]
+        Ebar_pv = torch.einsum('bij,kj->bik', E, self.Rk.to(device=x.device)) # [batch, De, N]
+        return Ebar_pv
+        
     def forward(self, x, y):
+        x = self.batchnorm_x(x) # [batch, P, N]
+        y = self.batchnorm_y(y) # [batch, S, Nv]
+        
         # pf - pf
-        Orr = self.tmul(x, self.Rr)
-        Ors = self.tmul(x, self.Rs)
-        B = torch.cat([Orr, Ors], dim=1)
-        B = torch.transpose(B, 1, 2).contiguous()
-        B = nn.functional.relu(self.fr1(B.view(-1, 2 * self.P + self.Dr)))
-        B = nn.functional.relu(self.fr2(B))
-        E = nn.functional.relu(self.fr3(B).view(-1, self.Nr, self.De))
-        del B
-        E = torch.transpose(E, 1, 2).contiguous()
-        Ebar_pp = self.tmul(E, torch.transpose(self.Rr, 0, 1).contiguous())
-        del E
-
+        Ebar_pp = self.edge_conv(x) # [batch, De, N]
+        
         # sv - pf
-        Ork = self.tmul(x, self.Rk)
-        Orv = self.tmul(y, self.Rv)
-        B = torch.cat([Ork, Orv], 1)
-        B = torch.transpose(B, 1, 2).contiguous()
-        B = nn.functional.relu(self.fr1_pv(B.view(-1, self.S + self.P + self.Dr)))
-        B = nn.functional.relu(self.fr2_pv(B))
-        E = nn.functional.relu(self.fr3_pv(B).view(-1, self.Nt, self.De))
-        del B
-        E = torch.transpose(E, 1, 2).contiguous()
-        Ebar_pv = self.tmul(E, torch.transpose(self.Rk, 0, 1).contiguous())
-        Ebar_vp = self.tmul(E, torch.transpose(self.Rv, 0, 1).contiguous())
-        del E
-
-        # Final output matrix 
-        C = torch.cat([x, Ebar_pp, Ebar_pv], 1)
-        del Ebar_pp
-        del Ebar_pv
-        C = torch.transpose(C, 1, 2).contiguous()
-        C = nn.functional.relu(self.fo1(C.view(-1, self.P + self.Dx + (2 * self.De))))
-        C = nn.functional.relu(self.fo2(C))
-        O = nn.functional.relu(self.fo3(C).view(-1, self.N, self.Do))
-        del C
-
+        Ebar_pv = self.edge_conv_SV(x, y) # [batch, De, N]
+        
+        # Final output matrix
+        C = torch.cat([x, Ebar_pp, Ebar_pv], dim=-2) # [batch, P + 2*De, N]
+        C = C.transpose(-1, -2).contiguous() # [batch, N, P + 2*De]
+        O = self.fo(C.view(-1, self.P+2*self.De)).view(-1, self.N, self.Do) # [batch, N, Do]
+        O = O.transpose(-1, -2).contiguous() # [batch, Do, N]
+        
         # Taking the sum of over each particle/vertex
-        N = torch.sum(O, dim=1)
-        del O
+        N = torch.sum(O, dim=-1) # [batch, Do]
 
         # Classification MLP
-        N = self.fc_fixed(N)
+        N = self.fc_fixed(N) # [batch, Do]
 
         return N
